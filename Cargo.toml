@@ -11,14 +11,16 @@ keywords = ["printing", "ipp", "cups", "printer"]
 categories = ["hardware-support"]
 
 [features]
-default = ["ipp-client", "windows-spooler"]
-ipp-client = ["dep:ipp", "dep:tokio"]
+default = ["ipp-client", "aws-lc-rs", "windows-spooler"]
+ipp-client = ["dep:ipp", "dep:tokio", "ipp/async-client-rustls-no-provider"]
+aws-lc-rs = ["ipp?/async-client-rustls"]
 windows-spooler = ["dep:printers"]
 
 [dependencies]
 thiserror = "2"
 tracing = "0.1"
-ipp = { version = "8.0", default-features = false, features = ["async-client-rustls"], optional = true }
+# The TLS features come from this crate's own, above.
+ipp = { version = "8.0", default-features = false, optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "time"], optional = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -47,7 +47,10 @@ If `None` or `"auto"` is passed as `spec`, the backend is auto-detected:
 
 ## Features
 
+All features are enabled by default.
+
 * `ipp-client` — the IPP backend
+* `aws-lc-rs` — picks the TLS provider for it
 * `windows-spooler` — `Local::WinSpooler` support via the `printers` crate
 
 The local backends are synchronous and spawn at most one child process, so
