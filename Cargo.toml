@@ -1,0 +1,28 @@
+[package]
+name = "universal-print"
+description = "A small shim for printing documents."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+authors = ["Nikita Sychev <root@nsychev.ru>"]
+repository = "https://github.com/nsychev/universal-print-rs"
+keywords = ["printing", "ipp", "cups", "printer"]
+categories = ["hardware-support"]
+
+[features]
+default = ["ipp-client", "windows-spooler"]
+ipp-client = ["dep:ipp", "dep:tokio"]
+windows-spooler = ["dep:printers"]
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+ipp = { version = "8.0", default-features = false, features = ["async-client-rustls"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "time"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+printers = { version = "2.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
