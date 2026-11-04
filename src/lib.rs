@@ -1,17 +1,20 @@
 //! Send a document to the printer using one of supported backends.
 //!
 //! * [`ipp_client`] forwards over IPP.
-//! * [`local`] uses CUPS, the Windows spooler, or a custom command.
+//! * [`local`] uses CUPS, the Windows print spooler, SumatraPDF, or a
+//!   custom command.
+//!
+//! [`Sink::detect`] builds either of them from a spec or the default for the platform.
 
 pub mod local;
 
 #[cfg(feature = "ipp-client")]
 pub mod ipp_client;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub use local::Local;
+pub use local::{Local, LocalJob};
 
 /// How long a local print command may run before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -88,6 +91,60 @@ impl std::fmt::Debug for Sink {
 }
 
 impl Sink {
+    /// Builds a sink from a short textual specification, or attempts to auto-detect one.
+    pub fn detect(spec: Option<&str>, printer: Option<&str>, timeout: Duration) -> Result<Sink> {
+        let spec = spec.map(str::trim).filter(|s| !s.is_empty());
+        let printer = printer.filter(|p| !p.is_empty());
+
+        let (name, value) = match spec {
+            Some(spec) => match spec.split_once(':') {
+                Some((name, value)) => (name, Some(value)),
+                None => (spec, None),
+            },
+            None => ("auto", None),
+        };
+        let name = name.to_ascii_lowercase();
+
+        // A URI is told apart by its scheme, which only `ipp://` and friends
+        // can have: every other spec is a bare name or `name:value`.
+        if value.is_some() && matches!(name.as_str(), "ipp" | "ipps" | "http" | "https") {
+            return ipp_sink(spec.unwrap_or_default(), printer);
+        }
+
+        let backend = match name.as_str() {
+            "auto" => Local::default_backend()?,
+            "lp" => Local::Lp,
+            "lpr" => Local::Lpr,
+            "winspooler" => win_spooler()?,
+            "sumatra" => {
+                Local::Sumatra(helper(value, "SumatraPDF", "sumatra", local::find_sumatra)?)
+            }
+            "command" => {
+                let template = value.filter(|t| !t.trim().is_empty()).ok_or_else(|| {
+                    Error::Unsupported(
+                        "a command spec needs a template, as in \
+                         command:lp -d {printer} {file}"
+                            .into(),
+                    )
+                })?;
+                Local::Command(template.to_string())
+            }
+            "dry-run" => Local::DryRun,
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "unknown destination {other:?}; use auto, lp, lpr, winspooler, \
+                     sumatra[:path], command:<template>, dry-run, or an ipp:// URI"
+                )));
+            }
+        };
+
+        Ok(Sink::Local {
+            backend,
+            printer: printer.map(str::to_string),
+            timeout,
+        })
+    }
+
     /// A description for a startup log line.
     pub fn label(&self) -> String {
         match self {
@@ -140,40 +197,77 @@ impl Sink {
             } => {
                 let file = spool(job)?;
                 let backend = backend.clone();
-                let printer = printer.clone();
-                let timeout = *timeout;
-                let copies = job.copies;
-                let media = job.media.map(str::to_string);
+                let job = local::LocalJob::new(job, printer.as_deref(), *timeout);
 
                 // The local backends block on a child process, so they must
                 // not run on the async runtime's worker threads.
                 #[cfg(feature = "ipp-client")]
                 {
-                    tokio::task::spawn_blocking(move || {
-                        backend.print_file(
-                            file.path(),
-                            printer.as_deref(),
-                            copies,
-                            media.as_deref(),
-                            timeout,
-                        )
-                    })
-                    .await
-                    .map_err(|e| Error::Backend(format!("the print task failed: {e}")))?
+                    tokio::task::spawn_blocking(move || backend.print_file(file.path(), &job))
+                        .await
+                        .map_err(|e| Error::Backend(format!("the print task failed: {e}")))?
                 }
                 #[cfg(not(feature = "ipp-client"))]
                 {
-                    backend.print_file(
-                        file.path(),
-                        printer.as_deref(),
-                        copies,
-                        media.as_deref(),
-                        timeout,
-                    )
+                    backend.print_file(file.path(), &job)
                 }
             }
         }
     }
+}
+
+/// Takes the path a spec gave for a helper application, or looks for it.
+fn helper(
+    value: Option<&str>,
+    title: &str,
+    spec: &str,
+    find: impl Fn() -> Option<PathBuf>,
+) -> Result<PathBuf> {
+    match value.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => find().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{title} was not found; name it with {spec}:<path> or pass a print command"
+            ))
+        }),
+    }
+}
+
+/// The Windows print spooler, if this platform and build have one.
+fn win_spooler() -> Result<Local> {
+    if !cfg!(windows) {
+        return Err(Error::Unsupported(
+            "the Windows print spooler is Windows-only; on Unix use lp or lpr".into(),
+        ));
+    }
+    if !cfg!(feature = "windows-spooler") {
+        return Err(Error::Unsupported(
+            "the Windows print spooler needs the windows-spooler feature, which this build \
+             turned off"
+                .into(),
+        ));
+    }
+    Ok(Local::WinSpooler)
+}
+
+#[cfg(feature = "ipp-client")]
+fn ipp_sink(uri: &str, printer: Option<&str>) -> Result<Sink> {
+    if let Some(printer) = printer {
+        return Err(Error::Unsupported(format!(
+            "an IPP URI already names its queue, so it cannot also be pointed at {printer:?}"
+        )));
+    }
+    let parsed = uri
+        .parse::<ipp::prelude::Uri>()
+        .map_err(|e| Error::Unsupported(format!("{uri:?} is not a usable IPP URI: {e}")))?;
+    Ok(Sink::Ipp(ipp_client::IppSink::new(parsed)))
+}
+
+#[cfg(not(feature = "ipp-client"))]
+fn ipp_sink(uri: &str, _printer: Option<&str>) -> Result<Sink> {
+    Err(Error::Unsupported(format!(
+        "cannot print to {uri:?}: the ipp-client feature is off in this build"
+    )))
 }
 
 /// A temporary file that removes itself.
@@ -246,6 +340,135 @@ mod tests {
             let spooled = spool(&job).unwrap();
             assert_eq!(spooled.path().extension().unwrap(), extension);
         }
+    }
+
+    #[test]
+    fn a_spec_names_a_local_backend() {
+        for (spec, expected) in [
+            ("lp", Local::Lp),
+            ("LPR", Local::Lpr),
+            ("dry-run", Local::DryRun),
+            ("DRY-RUN", Local::DryRun),
+        ] {
+            let sink = Sink::detect(Some(spec), None, DEFAULT_TIMEOUT).unwrap();
+            assert!(
+                matches!(&sink, Sink::Local { backend, .. } if *backend == expected),
+                "{spec} gave {sink:?}"
+            );
+        }
+        assert!(Sink::detect(Some("nonsense"), None, DEFAULT_TIMEOUT).is_err());
+
+        // Each backend has exactly one spelling; these redundant ones were
+        // dropped, and nothing should quietly accept them again.
+        for dropped in ["default", "none", "dryrun", "win-spooler"] {
+            assert!(
+                Sink::detect(Some(dropped), None, DEFAULT_TIMEOUT).is_err(),
+                "{dropped} is still accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_printer_name_rides_along_with_a_local_backend() {
+        let sink = Sink::detect(Some("lp"), Some("HP"), DEFAULT_TIMEOUT).unwrap();
+        assert!(matches!(&sink, Sink::Local { printer: Some(p), .. } if p == "HP"));
+        assert!(sink.label().contains("HP"));
+
+        // An empty name is no name at all.
+        let sink = Sink::detect(Some("lp"), Some(""), DEFAULT_TIMEOUT).unwrap();
+        assert!(matches!(sink, Sink::Local { printer: None, .. }));
+    }
+
+    #[test]
+    fn a_command_spec_keeps_the_rest_of_the_line() {
+        let sink = Sink::detect(
+            Some("command:lp -d {printer} -o media=A4 {file}"),
+            None,
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap();
+        assert!(
+            matches!(&sink, Sink::Local { backend: Local::Command(t), .. }
+                if t == "lp -d {printer} -o media=A4 {file}"),
+            "{sink:?}"
+        );
+        assert!(Sink::detect(Some("command:"), None, DEFAULT_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn an_explicit_helper_path_is_taken_as_given() {
+        let sink = Sink::detect(
+            Some(r"sumatra:C:\Tools\SumatraPDF.exe"),
+            None,
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap();
+        assert!(
+            matches!(&sink, Sink::Local { backend: Local::Sumatra(exe), .. }
+                if exe == Path::new(r"C:\Tools\SumatraPDF.exe")),
+            "{sink:?}"
+        );
+    }
+
+    #[test]
+    fn the_windows_spooler_is_only_offered_where_it_works() {
+        let chosen = Sink::detect(Some("winspooler"), None, DEFAULT_TIMEOUT);
+        if cfg!(all(windows, feature = "windows-spooler")) {
+            assert!(matches!(
+                chosen.unwrap(),
+                Sink::Local {
+                    backend: Local::WinSpooler,
+                    ..
+                }
+            ));
+        } else {
+            assert!(chosen.is_err());
+        }
+    }
+
+    #[test]
+    fn no_spec_at_all_means_the_default_mode() {
+        let bare = Sink::detect(None, None, DEFAULT_TIMEOUT);
+        let named = Sink::detect(Some("auto"), None, DEFAULT_TIMEOUT);
+        let blank = Sink::detect(Some("   "), None, DEFAULT_TIMEOUT);
+        for sink in [&bare, &named, &blank] {
+            match sink {
+                Ok(Sink::Local { backend, .. }) => {
+                    assert_eq!(*backend, *Local::default_backend().as_ref().unwrap())
+                }
+                Err(error) => assert!(error.to_string().contains("no print"), "{error}"),
+                #[cfg(feature = "ipp-client")]
+                Ok(other) => panic!("the default mode must stay local, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "ipp-client")]
+    #[test]
+    fn an_ipp_uri_becomes_an_ipp_sink() {
+        let sink =
+            Sink::detect(Some("ipp://printer.lan/ipp/print"), None, DEFAULT_TIMEOUT).unwrap();
+        assert!(matches!(sink, Sink::Ipp(_)));
+        assert!(sink.label().contains("printer.lan"), "{sink:?}");
+
+        // The queue is in the URI, so a second name would be ambiguous.
+        assert!(
+            Sink::detect(
+                Some("ipp://printer.lan/ipp/print"),
+                Some("HP"),
+                DEFAULT_TIMEOUT
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(not(feature = "ipp-client"))]
+    #[test]
+    fn an_ipp_uri_without_the_feature_says_so() {
+        let error = Sink::detect(Some("ipp://printer.lan/ipp/print"), None, DEFAULT_TIMEOUT)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ipp-client"), "{error}");
     }
 
     #[tokio::test]

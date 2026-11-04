@@ -10,19 +10,53 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
+/// Job metadata for a local backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalJob {
+    /// A title for the printer's queue.
+    pub name: String,
+    /// The queue to print on, or the platform's default one.
+    pub printer: Option<String>,
+    pub copies: u32,
+    /// A PWG media name, e.g. `iso_a4_210x297mm`.
+    pub media: Option<String>,
+    /// `one-sided`, `two-sided-long-edge` or `two-sided-short-edge`. Only
+    /// [`Local::Lp`] can pass this on; see [`Local::print_file`].
+    pub sides: String,
+    /// How long the print command may run before it is killed.
+    pub timeout: Duration,
+}
+
+impl LocalJob {
+    /// An empty `printer` is no printer at all, and means the default queue.
+    pub fn new(job: &crate::Job<'_>, printer: Option<&str>, timeout: Duration) -> Self {
+        LocalJob {
+            name: job.name.to_string(),
+            printer: printer.filter(|name| !name.is_empty()).map(str::to_string),
+            copies: job.copies,
+            media: job.media.map(str::to_string),
+            sides: job.sides.to_string(),
+            timeout,
+        }
+    }
+
+    /// Whether the job asks for duplex printing.
+    fn is_duplex(&self) -> bool {
+        !self.sides.is_empty() && self.sides != "one-sided"
+    }
+}
+
 /// How a document reaches the printing subsystem.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Local {
-    /// In-process Windows Print Spooler (Windows only).
-    Native,
     /// CUPS `lp`.
     Lp,
     /// BSD `lpr`.
     Lpr,
     /// SumatraPDF binary.
     Sumatra(PathBuf),
-    /// Adobe Acrobat or Reader in "print to printer" mode.
-    Acrobat(PathBuf),
+    /// In-process Windows Print Spooler (Windows only).
+    WinSpooler,
     /// Custom command. `{file}` and `{printer}` are substituted.
     Command(String),
     /// Discard the job.
@@ -33,54 +67,22 @@ impl Local {
     /// A short description, for a status line.
     pub fn label(&self) -> String {
         match self {
-            Local::Native => "Windows spooler".into(),
             Local::Lp => "lp (CUPS)".into(),
             Local::Lpr => "lpr".into(),
             Local::Sumatra(path) => format!("SumatraPDF ({})", path.display()),
-            Local::Acrobat(path) => format!("Acrobat ({})", path.display()),
+            Local::WinSpooler => "Windows print spooler".into(),
             Local::Command(template) => format!("command: {template}"),
             Local::DryRun => "dry run".into(),
         }
     }
 
-    /// Whether this backend can be pointed at a named printer.
-    pub fn supports_printer_choice(&self) -> bool {
-        !matches!(self, Local::DryRun)
-    }
-
-    /// Picks a backend by name, or by what is installed.
-    pub fn detect(explicit: Option<&str>, command: Option<&str>) -> Result<Self> {
-        if let Some(template) = command {
-            return Ok(Local::Command(template.to_string()));
-        }
-        match explicit.map(str::to_ascii_lowercase).as_deref() {
-            None | Some("auto") => Self::auto(),
-            Some("native") => {
-                if cfg!(windows) {
-                    Ok(Local::Native)
-                } else {
-                    Err(Error::Unsupported(
-                        "the native backend is Windows-only; on Unix use lp or lpr".into(),
-                    ))
-                }
-            }
-            Some("lp") => Ok(Local::Lp),
-            Some("lpr") => Ok(Local::Lpr),
-            Some("sumatra") => find_sumatra().map(Local::Sumatra).ok_or_else(|| {
-                Error::Unsupported("SumatraPDF was not found; pass a print command instead".into())
-            }),
-            Some("acrobat") => find_acrobat().map(Local::Acrobat).ok_or_else(|| {
-                Error::Unsupported("Acrobat was not found; pass a print command instead".into())
-            }),
-            Some("dry-run") | Some("none") => Ok(Local::DryRun),
-            Some(other) => Err(Error::Unsupported(format!(
-                "unknown backend {other:?}; use auto, native, lp, lpr, sumatra, acrobat or dry-run"
-            ))),
-        }
-    }
-
+    /// The backend to use when the caller states no preference.
+    ///
+    /// On Unix, it tries `lp`, then `lpr`, then fails.
+    ///
+    /// [`crate::Sink::detect`] calls this for the `auto` spec.
     #[cfg(unix)]
-    fn auto() -> Result<Self> {
+    pub fn default_backend() -> Result<Self> {
         if which("lp").is_some() {
             return Ok(Local::Lp);
         }
@@ -92,112 +94,69 @@ impl Local {
         ))
     }
 
+    /// The backend to use when the caller states no preference.
+    ///
+    /// On Windows, it tries SumatraPDF, then falls back to `WinSpooler`.
+    ///
+    /// [`crate::Sink::detect`] calls this for the `auto` spec.
     #[cfg(windows)]
-    fn auto() -> Result<Self> {
-        // The spooler needs no helper application, so it is the default.
-        Ok(Local::Native)
+    pub fn default_backend() -> Result<Self> {
+        if let Some(exe) = find_sumatra() {
+            return Ok(Local::Sumatra(exe));
+        }
+        if cfg!(feature = "windows-spooler") {
+            Ok(Local::WinSpooler)
+        } else {
+            Err(Error::Unsupported(
+                "SumatraPDF was not found and the windows-spooler feature is off: \
+                 install SumatraPDF or pass a print command"
+                    .into(),
+            ))
+        }
     }
 
+    /// See the Unix documentation for this method.
     #[cfg(not(any(unix, windows)))]
-    fn auto() -> Result<Self> {
+    pub fn default_backend() -> Result<Self> {
         Err(Error::Unsupported(
             "unsupported platform: pass a print command".into(),
         ))
     }
 
-    /// Prints a file, blocking until the command finishes or `timeout` passes.
-    pub fn print_file(
-        &self,
-        file: &Path,
-        printer: Option<&str>,
-        copies: u32,
-        media: Option<&str>,
-        timeout: Duration,
-    ) -> Result<()> {
-        if matches!(self, Local::Native) {
-            return print_native(file, printer, copies);
+    /// Prints a file, blocking until the command finishes or the job's
+    /// `timeout` passes.
+    pub fn print_file(&self, file: &Path, job: &LocalJob) -> Result<()> {
+        if matches!(self, Local::WinSpooler) {
+            return print_win_spooler(file, job);
         }
 
-        let Some(mut command) = self.build(file, printer, copies, media)? else {
+        let Some(command) = self.build(file, job)? else {
             return Ok(()); // dry run
         };
-
-        command.stdin(Stdio::null());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-
-        let mut child = command
-            .spawn()
-            .map_err(|e| Error::Backend(format!("could not start the print command: {e}")))?;
-
-        // A wedged print command must not stall the queue for everyone else.
-        let deadline = Instant::now() + timeout;
-        loop {
-            match child
-                .try_wait()
-                .map_err(|e| Error::Backend(e.to_string()))?
-            {
-                Some(status) => {
-                    let output = child
-                        .wait_with_output()
-                        .map_err(|e| Error::Backend(e.to_string()))?;
-                    if status.success() {
-                        return Ok(());
-                    }
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let detail = [stderr.trim(), stdout.trim()]
-                        .iter()
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" / ");
-                    return Err(Error::Backend(format!(
-                        "the print command failed ({}){}",
-                        status
-                            .code()
-                            .map(|c| format!("exit {c}"))
-                            .unwrap_or_else(|| "terminated".into()),
-                        if detail.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {}", truncate(&detail, 300))
-                        }
-                    )));
-                }
-                None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    return Err(Error::Backend(format!(
-                        "the print command timed out after {}s",
-                        timeout.as_secs()
-                    )));
-                }
-                None => std::thread::sleep(Duration::from_millis(50)),
-            }
-        }
+        run(command, job.timeout)
     }
 
     /// Builds the child process. `None` means there is nothing to run.
-    fn build(
-        &self,
-        file: &Path,
-        printer: Option<&str>,
-        copies: u32,
-        media: Option<&str>,
-    ) -> Result<Option<Command>> {
-        let printer = printer.filter(|p| !p.is_empty());
+    fn build(&self, file: &Path, job: &LocalJob) -> Result<Option<Command>> {
+        let printer = job.printer.as_deref();
         let command = match self {
-            Local::DryRun | Local::Native => return Ok(None),
+            Local::DryRun | Local::WinSpooler => return Ok(None),
             Local::Lp => {
                 let mut c = Command::new("lp");
                 if let Some(name) = printer {
                     c.arg("-d").arg(name);
                 }
-                if copies > 1 {
-                    c.arg("-n").arg(copies.to_string());
+                if !job.name.is_empty() {
+                    c.arg("-t").arg(&job.name);
                 }
-                if let Some(media) = media {
+                if job.copies > 1 {
+                    c.arg("-n").arg(job.copies.to_string());
+                }
+                if let Some(media) = &job.media {
                     c.arg("-o").arg(format!("media={media}"));
+                }
+                if job.is_duplex() {
+                    c.arg("-o").arg(format!("sides={sides}", sides = job.sides));
                 }
                 c.arg("--").arg(file);
                 c
@@ -207,8 +166,11 @@ impl Local {
                 if let Some(name) = printer {
                     c.arg("-P").arg(name);
                 }
-                if copies > 1 {
-                    c.arg("-#").arg(copies.to_string());
+                if !job.name.is_empty() {
+                    c.arg("-T").arg(&job.name);
+                }
+                if job.copies > 1 {
+                    c.arg("-#").arg(job.copies.to_string());
                 }
                 c.arg(file);
                 c
@@ -223,20 +185,13 @@ impl Local {
                         c.arg("-print-to-default");
                     }
                 }
-                c.arg("-silent").arg("-exit-when-done").arg(file);
-                c
-            }
-            Local::Acrobat(exe) => {
-                let mut c = Command::new(exe);
-                match printer {
-                    // /t prints to a named printer, /p to the default one.
-                    Some(name) => {
-                        c.arg("/t").arg(file).arg(name);
-                    }
-                    None => {
-                        c.arg("/p").arg("/h").arg(file);
-                    }
+                // Sumatra takes its print options as one comma-separated
+                // list, in which `<n>x` is the copy count.
+                if job.copies > 1 {
+                    c.arg("-print-settings")
+                        .arg(format!("{copies}x", copies = job.copies));
                 }
+                c.arg("-silent").arg("-exit-when-done").arg(file);
                 c
             }
             Local::Command(template) => {
@@ -256,6 +211,63 @@ impl Local {
     }
 }
 
+/// Runs one print command, blocking until it exits or `timeout` passes.
+fn run(mut command: Command, timeout: Duration) -> Result<()> {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| Error::Backend(format!("could not start the print command: {e}")))?;
+
+    // A wedged print command must not stall the queue for everyone else.
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| Error::Backend(e.to_string()))?
+        {
+            Some(status) => {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|e| Error::Backend(e.to_string()))?;
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let detail = [stderr.trim(), stdout.trim()]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                return Err(Error::Backend(format!(
+                    "the print command failed ({}){}",
+                    status
+                        .code()
+                        .map(|c| format!("exit {c}"))
+                        .unwrap_or_else(|| "terminated".into()),
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", truncate(&detail, 300))
+                    }
+                )));
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                return Err(Error::Backend(format!(
+                    "the print command timed out after {}s",
+                    timeout.as_secs()
+                )));
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 /// Substitutes `{file}` and `{printer}` in a command template.
 pub fn expand(template: &str, file: &Path, printer: Option<&str>) -> String {
     template
@@ -264,11 +276,10 @@ pub fn expand(template: &str, file: &Path, printer: Option<&str>) -> String {
 }
 
 #[cfg(all(windows, feature = "windows-spooler"))]
-fn print_native(file: &Path, printer: Option<&str>, copies: u32) -> Result<()> {
+fn print_win_spooler(file: &Path, job: &LocalJob) -> Result<()> {
     use printers::common::base::job::PrinterJobOptions;
 
-    let printer = printer.filter(|p| !p.is_empty());
-    let target = match printer {
+    let target = match job.printer.as_deref() {
         Some(name) => printers::get_printer_by_name(name)
             .ok_or_else(|| Error::Backend(format!("no printer named {name:?}")))?,
         None => printers::get_default_printer()
@@ -278,12 +289,12 @@ fn print_native(file: &Path, printer: Option<&str>, copies: u32) -> Result<()> {
         .to_str()
         .ok_or_else(|| Error::Backend("the spool path is not valid UTF-8".into()))?;
 
-    for _ in 0..copies.max(1) {
+    for _ in 0..job.copies.max(1) {
         target
             .print_file(
                 path,
                 PrinterJobOptions {
-                    name: Some("watermark-printer"),
+                    name: Some(job.name.as_str()),
                     ..PrinterJobOptions::none()
                 },
             )
@@ -293,9 +304,11 @@ fn print_native(file: &Path, printer: Option<&str>, copies: u32) -> Result<()> {
 }
 
 #[cfg(not(all(windows, feature = "windows-spooler")))]
-fn print_native(_file: &Path, _printer: Option<&str>, _copies: u32) -> Result<()> {
+fn print_win_spooler(_file: &Path, _job: &LocalJob) -> Result<()> {
     Err(Error::Unsupported(
-        "the native backend needs the windows-spooler feature, which this build turned off".into(),
+        "the Windows print spooler needs the windows-spooler feature, which this build \
+         turned off"
+            .into(),
     ))
 }
 
@@ -350,30 +363,6 @@ pub fn find_sumatra() -> Option<PathBuf> {
     None
 }
 
-/// Finds Acrobat Reader or Acrobat.
-pub fn find_acrobat() -> Option<PathBuf> {
-    for exe in ["AcroRd32", "Acrobat"] {
-        if let Some(found) = which(exe) {
-            return Some(found);
-        }
-    }
-    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(base) = std::env::var_os(variable) {
-            for relative in [
-                r"Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-                r"Adobe\Reader 11.0\Reader\AcroRd32.exe",
-                r"Adobe\Acrobat DC\Acrobat\Acrobat.exe",
-            ] {
-                let candidate = PathBuf::from(&base).join(relative);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    None
-}
-
 fn truncate(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_string();
@@ -393,9 +382,20 @@ mod tests {
         }
     }
 
-    fn command_args(backend: &Local, printer: Option<&str>, copies: u32) -> Vec<String> {
+    fn job(printer: Option<&str>, copies: u32) -> LocalJob {
+        LocalJob {
+            name: "my job".into(),
+            printer: printer.filter(|name| !name.is_empty()).map(str::to_string),
+            copies,
+            media: Some("A4".into()),
+            sides: "one-sided".into(),
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    fn command_args(backend: &Local, job: &LocalJob) -> Vec<String> {
         backend
-            .build(Path::new("/tmp/job.pdf"), printer, copies, Some("A4"))
+            .build(Path::new("/tmp/job.pdf"), job)
             .unwrap()
             .unwrap()
             .get_args()
@@ -404,49 +404,123 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_backend_wins_over_detection() {
-        assert_eq!(Local::detect(Some("lp"), None).unwrap(), Local::Lp);
-        assert_eq!(Local::detect(Some("LPR"), None).unwrap(), Local::Lpr);
-        assert_eq!(Local::detect(Some("dry-run"), None).unwrap(), Local::DryRun);
-        assert!(Local::detect(Some("nonsense"), None).is_err());
-    }
-
-    #[test]
-    fn a_print_command_overrides_everything() {
-        assert_eq!(
-            Local::detect(Some("lp"), Some("mycmd {file}")).unwrap(),
-            Local::Command("mycmd {file}".into())
-        );
-    }
-
-    #[test]
-    fn the_native_backend_is_windows_only() {
-        let chosen = Local::detect(Some("native"), None);
-        if cfg!(windows) {
-            assert_eq!(chosen.unwrap(), Local::Native);
-        } else {
-            assert!(chosen.unwrap_err().to_string().contains("Windows-only"));
+    fn the_default_backend_is_one_of_the_platform_chain() {
+        match Local::default_backend() {
+            Ok(backend) if cfg!(unix) => {
+                assert!(matches!(backend, Local::Lp | Local::Lpr), "{backend:?}")
+            }
+            Ok(backend) if cfg!(windows) => assert!(
+                matches!(backend, Local::Sumatra(_) | Local::WinSpooler),
+                "{backend:?}"
+            ),
+            Ok(backend) => panic!("unexpected backend {backend:?}"),
+            // A machine with nothing installed is allowed to say so.
+            Err(error) => assert!(error.to_string().contains("no print"), "{error}"),
         }
     }
 
     #[test]
-    fn lp_is_told_the_printer_the_copies_and_the_media() {
-        let args = command_args(&Local::Lp, Some("HP"), 3);
+    fn lp_is_told_the_printer_the_title_the_copies_and_the_media() {
+        let args = command_args(&Local::Lp, &job(Some("HP"), 3));
         assert!(args.windows(2).any(|w| w == ["-d", "HP"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["-t", "my job"]), "{args:?}");
         assert!(args.windows(2).any(|w| w == ["-n", "3"]), "{args:?}");
         assert!(args.contains(&"media=A4".to_string()), "{args:?}");
         assert!(args.last().unwrap().ends_with("job.pdf"));
 
         // One copy is the default, so it is not spelled out.
-        let args = command_args(&Local::Lp, None, 1);
+        let args = command_args(&Local::Lp, &job(None, 1));
         assert!(!args.contains(&"-n".to_string()), "{args:?}");
         assert!(!args.contains(&"-d".to_string()), "{args:?}");
     }
 
     #[test]
+    fn lpr_is_told_the_printer_the_title_and_the_copies() {
+        let args = command_args(&Local::Lpr, &job(Some("HP"), 3));
+        assert!(args.windows(2).any(|w| w == ["-P", "HP"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["-T", "my job"]), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["-#", "3"]), "{args:?}");
+        // lpr has no portable way to ask for either of these.
+        assert!(!args.contains(&"media=A4".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn sumatra_is_told_the_copy_count_in_its_own_spelling() {
+        let exe = PathBuf::from("sumatra.exe");
+
+        let args = command_args(&Local::Sumatra(exe.clone()), &job(Some("HP"), 3));
+        assert!(
+            args.windows(2).any(|w| w == ["-print-settings", "3x"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-print-to", "HP"]),
+            "{args:?}"
+        );
+
+        // One copy is the default, so it is not spelled out.
+        let args = command_args(&Local::Sumatra(exe), &job(None, 1));
+        assert!(!args.contains(&"-print-settings".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn only_lp_is_asked_for_duplex_and_only_when_it_is_wanted() {
+        let mut duplex = job(None, 1);
+        duplex.sides = "two-sided-long-edge".into();
+
+        let args = command_args(&Local::Lp, &duplex);
+        assert!(
+            args.contains(&"sides=two-sided-long-edge".to_string()),
+            "{args:?}"
+        );
+
+        // One-sided is the default, so it is not spelled out.
+        let args = command_args(&Local::Lp, &job(None, 1));
+        assert!(!args.iter().any(|a| a.starts_with("sides=")), "{args:?}");
+
+        // The rest drop it rather than refuse the job.
+        let args = command_args(&Local::Lpr, &duplex);
+        assert!(!args.iter().any(|a| a.starts_with("sides=")), "{args:?}");
+    }
+
+    #[test]
     fn an_empty_printer_name_means_the_default_printer() {
-        let args = command_args(&Local::Lp, Some(""), 1);
+        let args = command_args(&Local::Lp, &job(Some(""), 1));
         assert!(!args.contains(&"-d".to_string()), "{args:?}");
+
+        // Sumatra has a separate flag for the default queue.
+        let exe = PathBuf::from("sumatra.exe");
+        let args = command_args(&Local::Sumatra(exe), &job(Some(""), 1));
+        assert!(args.contains(&"-print-to-default".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn a_job_takes_the_printer_and_the_preferences_from_a_sink_job() {
+        let mut source = crate::Job::new(b"%PDF-1.7", "application/pdf", "the title");
+        source.copies = 4;
+        source.media = Some("iso_a4_210x297mm");
+        source.sides = "two-sided-short-edge";
+
+        let job = LocalJob::new(&source, Some("HP"), Duration::from_secs(5));
+        assert_eq!(job.name, "the title");
+        assert_eq!(job.printer.as_deref(), Some("HP"));
+        assert_eq!(job.copies, 4);
+        assert_eq!(job.media.as_deref(), Some("iso_a4_210x297mm"));
+        assert!(job.is_duplex());
+
+        // An empty name is no name at all.
+        let job = LocalJob::new(&source, Some(""), Duration::from_secs(5));
+        assert_eq!(job.printer, None);
+
+        // A plain job asks for nothing.
+        let job = LocalJob::new(
+            &crate::Job::new(b"x", "application/pdf", "t"),
+            None,
+            Duration::from_secs(5),
+        );
+        assert_eq!(job.copies, 1);
+        assert_eq!(job.media, None);
+        assert!(!job.is_duplex());
     }
 
     #[test]
@@ -466,19 +540,13 @@ mod tests {
     fn a_dry_run_builds_no_command_and_prints_nothing() {
         assert!(
             Local::DryRun
-                .build(Path::new("/tmp/j.pdf"), None, 1, None)
+                .build(Path::new("/tmp/j.pdf"), &job(None, 1))
                 .unwrap()
                 .is_none()
         );
         assert!(
             Local::DryRun
-                .print_file(
-                    Path::new("/tmp/j.pdf"),
-                    None,
-                    1,
-                    None,
-                    Duration::from_secs(1)
-                )
+                .print_file(Path::new("/tmp/j.pdf"), &job(None, 1))
                 .is_ok()
         );
     }
@@ -490,13 +558,7 @@ mod tests {
             "echo some-failure 1>&2 && exit 3",
         ));
         let error = backend
-            .print_file(
-                Path::new("/tmp/j.pdf"),
-                None,
-                1,
-                None,
-                Duration::from_secs(10),
-            )
+            .print_file(Path::new("/tmp/j.pdf"), &job(None, 1))
             .unwrap_err()
             .to_string();
         assert!(error.contains("exit 3"), "{error}");
@@ -508,13 +570,7 @@ mod tests {
         let backend = Local::Command(script("true", "exit 0"));
         assert!(
             backend
-                .print_file(
-                    Path::new("/tmp/j.pdf"),
-                    None,
-                    1,
-                    None,
-                    Duration::from_secs(10)
-                )
+                .print_file(Path::new("/tmp/j.pdf"), &job(None, 1))
                 .is_ok()
         );
     }
@@ -522,14 +578,10 @@ mod tests {
     #[test]
     fn a_hanging_command_is_killed() {
         let backend = Local::Command(script("sleep 30", "ping -n 31 127.0.0.1 > nul"));
+        let mut impatient = job(None, 1);
+        impatient.timeout = Duration::from_millis(200);
         let error = backend
-            .print_file(
-                Path::new("/tmp/j.pdf"),
-                None,
-                1,
-                None,
-                Duration::from_millis(200),
-            )
+            .print_file(Path::new("/tmp/j.pdf"), &impatient)
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"), "{error}");
