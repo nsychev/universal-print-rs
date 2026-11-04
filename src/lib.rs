@@ -104,6 +104,10 @@ impl Sink {
 
     /// Checks that the destination can take `format` if supported.
     pub async fn check(&self, format: &str) -> Result<()> {
+        // Only the IPP backend can answer this.
+        #[cfg(not(feature = "ipp-client"))]
+        let _ = format;
+
         match self {
             #[cfg(feature = "ipp-client")]
             Sink::Ipp(sink) => {
@@ -111,11 +115,7 @@ impl Sink {
                 if ipp_client::accepts(&formats, format) {
                     Ok(())
                 } else {
-                    Err(ipp_client::unsupported_format(
-                        sink.uri(),
-                        format,
-                        &formats,
-                    ))
+                    Err(ipp_client::unsupported_format(sink.uri(), format, &formats))
                 }
             }
             // Not supported for local backends.
