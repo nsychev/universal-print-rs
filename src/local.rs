@@ -46,6 +46,17 @@ impl LocalJob {
     }
 }
 
+/// A printer the operating system knows about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Printer {
+    /// The queue name, to pass as [`LocalJob::printer`].
+    pub name: String,
+    /// Whether a job with no printer named goes here.
+    pub is_default: bool,
+    /// Driver name, where the subsystem reports one.
+    pub driver: Option<String>,
+}
+
 /// How a document reaches the printing subsystem.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Local {
@@ -134,6 +145,31 @@ impl Local {
             return Ok(()); // dry run
         };
         run(command, job.timeout)
+    }
+
+    /// The printers this backend can send a job to.
+    ///
+    /// [`Local::Lp`] and [`Local::Lpr`] ask CUPS through `lpstat`.
+    /// [`Local::WinSpooler`] and [`Local::Sumatra`] ask the Windows Print
+    /// Spooler. Other backends do not support this.
+    pub fn printers(&self) -> Result<Vec<Printer>> {
+        match self {
+            Local::Lp | Local::Lpr => cups_printers(),
+            Local::WinSpooler | Local::Sumatra(_) => spooler_printers(),
+            Local::Command(_) => Err(Error::Unsupported(
+                "querying printers is not supported for this backend".into(),
+            )),
+            Local::DryRun => Ok(Vec::new()),
+        }
+    }
+
+    /// The default printer, if known.
+    pub fn default_printer(&self) -> Option<String> {
+        match self {
+            Local::Lp | Local::Lpr => cups_default(),
+            Local::WinSpooler | Local::Sumatra(_) => spooler_default(),
+            Local::Command(_) | Local::DryRun => None,
+        }
     }
 
     /// Builds the child process. `None` means there is nothing to run.
@@ -245,10 +281,7 @@ fn run(mut command: Command, timeout: Duration) -> Result<()> {
                     .join(" / ");
                 return Err(Error::Backend(format!(
                     "the print command failed ({}){}",
-                    status
-                        .code()
-                        .map(|c| format!("exit {c}"))
-                        .unwrap_or_else(|| "terminated".into()),
+                    exit_description(&status),
                     if detail.is_empty() {
                         String::new()
                     } else {
@@ -265,6 +298,126 @@ fn run(mut command: Command, timeout: Duration) -> Result<()> {
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
+    }
+}
+
+/// How a child process ended, for an error message.
+fn exit_description(status: &std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| format!("exit {code}"))
+        .unwrap_or_else(|| "terminated".into())
+}
+
+/// Asks CUPS which destinations it has.
+fn cups_printers() -> Result<Vec<Printer>> {
+    let listed = lpstat(&["-e"])?;
+    Ok(parse_destinations(&listed, cups_default().as_deref()))
+}
+
+/// The CUPS default destination, if one is set.
+fn cups_default() -> Option<String> {
+    parse_default(&lpstat(&["-d"]).ok()?)
+}
+
+/// Runs `lpstat` with `args`, returning its standard output.
+fn lpstat(args: &[&str]) -> Result<String> {
+    let output = Command::new("lpstat")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| {
+            Error::Unsupported(format!(
+                "could not run lpstat to list printers (is CUPS installed?): {e}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        return Err(Error::Backend(format!(
+            "lpstat {args} failed ({status}){detail}",
+            args = args.join(" "),
+            status = exit_description(&output.status),
+            detail = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", truncate(detail, 300))
+            }
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Reads the destinations out of `lpstat -e` output, one name per line.
+fn parse_destinations(stdout: &str, default: Option<&str>) -> Vec<Printer> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| Printer {
+            is_default: default == Some(name),
+            name: name.to_string(),
+            // CUPS has a PPD rather than a driver name worth showing.
+            driver: None,
+        })
+        .collect()
+}
+
+/// Reads the name out of `lpstat -d` output, which is one line reading
+/// `system default destination: NAME`, or saying there is none.
+fn parse_default(stdout: &str) -> Option<String> {
+    let (_, name) = stdout.lines().next()?.split_once(':')?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Asks the Windows print spooler which printers it has.
+#[cfg(all(windows, feature = "windows-spooler"))]
+fn spooler_printers() -> Result<Vec<Printer>> {
+    // Windows can leave the "default" attribute set on more than one
+    // printer, so take the spooler's own answer as the single authority.
+    let default = spooler_default();
+    Ok(printers::get_printers()
+        .into_iter()
+        .map(|printer| Printer {
+            is_default: default.as_deref() == Some(printer.name.as_str()),
+            name: printer.name,
+            driver: Some(printer.driver_name),
+        })
+        .collect())
+}
+
+/// See the Windows documentation for this function.
+#[cfg(not(all(windows, feature = "windows-spooler")))]
+fn spooler_printers() -> Result<Vec<Printer>> {
+    Err(spooler_unavailable())
+}
+
+/// The printer the Windows spooler sends unaddressed jobs to.
+#[cfg(all(windows, feature = "windows-spooler"))]
+fn spooler_default() -> Option<String> {
+    printers::get_default_printer().map(|printer| printer.name)
+}
+
+/// See the Windows documentation for this function.
+#[cfg(not(all(windows, feature = "windows-spooler")))]
+fn spooler_default() -> Option<String> {
+    None
+}
+
+/// Why the Windows print spooler is out of reach here.
+pub(crate) fn spooler_unavailable() -> Error {
+    if !cfg!(windows) {
+        Error::Unsupported(
+            "the Windows print spooler is Windows-only; on Unix use lp or lpr".into(),
+        )
+    } else {
+        Error::Unsupported(
+            "the Windows print spooler needs the windows-spooler feature, which this build \
+             turned off"
+                .into(),
+        )
     }
 }
 
@@ -305,11 +458,7 @@ fn print_win_spooler(file: &Path, job: &LocalJob) -> Result<()> {
 
 #[cfg(not(all(windows, feature = "windows-spooler")))]
 fn print_win_spooler(_file: &Path, _job: &LocalJob) -> Result<()> {
-    Err(Error::Unsupported(
-        "the Windows print spooler needs the windows-spooler feature, which this build \
-         turned off"
-            .into(),
-    ))
+    Err(spooler_unavailable())
 }
 
 /// Looks for an executable on `PATH`.
@@ -585,6 +734,92 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn each_backend_lists_the_printers_of_the_subsystem_it_prints_through() {
+        // Neither of these has a queue behind it, and they differ in whether
+        // that is worth an error: a dry run has none, a command may print
+        // anywhere at all and simply cannot be asked.
+        assert!(Local::DryRun.printers().unwrap().is_empty());
+        assert_eq!(Local::DryRun.default_printer(), None);
+
+        let error = Local::Command("mycmd {file}".into())
+            .printers()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported"), "{error}");
+        assert_eq!(
+            Local::Command("mycmd {file}".into()).default_printer(),
+            None
+        );
+
+        // CUPS answers for both Unix backends where it is installed, and a
+        // machine without it is allowed to say so.
+        for backend in [Local::Lp, Local::Lpr] {
+            match backend.printers() {
+                Ok(printers) => assert!(
+                    printers.iter().filter(|p| p.is_default).count() <= 1,
+                    "more than one default: {printers:?}"
+                ),
+                Err(error) => assert!(error.to_string().contains("lpstat"), "{error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_windows_backends_list_through_the_spooler() {
+        // Sumatra prints to the spooler's queues, so it is asked the same way.
+        for backend in [Local::WinSpooler, Local::Sumatra("sumatra.exe".into())] {
+            let listed = backend.printers();
+            if cfg!(all(windows, feature = "windows-spooler")) {
+                assert!(listed.is_ok(), "{:?}", listed.err());
+            } else {
+                // Off this platform or out of this build, it says which.
+                let error = listed.unwrap_err().to_string();
+                assert!(
+                    error.contains("Windows-only") || error.contains("windows-spooler"),
+                    "{error}"
+                );
+                assert_eq!(backend.default_printer(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn lpstat_output_is_read_as_names_and_the_one_default() {
+        let printers = parse_destinations("HP_LaserJet\n  Office \n\nBrother\n", Some("Office"));
+        assert_eq!(
+            printers.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["HP_LaserJet", "Office", "Brother"]
+        );
+        assert_eq!(
+            printers
+                .iter()
+                .filter(|p| p.is_default)
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Office"]
+        );
+        assert!(printers.iter().all(|p| p.driver.is_none()));
+
+        // A name CUPS does not list is no default here.
+        let printers = parse_destinations("HP\n", Some("Gone"));
+        assert!(printers.iter().all(|p| !p.is_default), "{printers:?}");
+        assert!(parse_destinations("   \n\n", None).is_empty());
+
+        assert_eq!(
+            parse_default("system default destination: HP\n").as_deref(),
+            Some("HP")
+        );
+        // Both ways CUPS can report that there is none.
+        assert_eq!(parse_default("no system default destination\n"), None);
+        assert_eq!(parse_default(""), None);
+        // Only the first line answers the question.
+        assert_eq!(
+            parse_default("system default destination: HP\nand then some nonsense\n").as_deref(),
+            Some("HP")
+        );
     }
 
     #[test]

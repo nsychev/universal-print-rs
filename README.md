@@ -12,6 +12,11 @@ let sink = Sink::detect(None, None, DEFAULT_TIMEOUT)?;
 // Fails at startup rather than one job at a time, where it can be asked.
 sink.check("application/pdf").await?;
 
+// List available queues for supported backends.
+for printer in sink.printers().await? {
+    println!("{}{}", printer.name, if printer.is_default { " (default)" } else { "" });
+}
+
 sink.print(&Job::new(b"%PDF-1.7 ...", "application/pdf", "my job")).await?;
 # Ok(())
 # }
@@ -43,7 +48,7 @@ If `None` or `"auto"` is passed as `spec`, the backend is auto-detected:
 * On Unix-based systems, it looks for `lp`, then `lpr`, then returns an error.
 * On Windows-based systems, it looks for SumatraPDF, then tries to use `WinSpooler`.
 
-`printer` names a queue for the local backends.
+`printer` names a queue for the local backends. Use `sink.printers()` to list them.
 
 ## Features
 

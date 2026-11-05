@@ -4,7 +4,8 @@
 //! * [`local`] uses CUPS, the Windows print spooler, SumatraPDF, or a
 //!   custom command.
 //!
-//! [`Sink::detect`] builds either of them from a spec or the default for the platform.
+//! [`Sink::detect`] builds either of them from a spec or the default for the
+//! platform.
 
 pub mod local;
 
@@ -14,7 +15,7 @@ pub mod ipp_client;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub use local::{Local, LocalJob};
+pub use local::{Local, LocalJob, Printer};
 
 /// How long a local print command may run before it is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -180,6 +181,18 @@ impl Sink {
         }
     }
 
+    /// The printers this destination can send a job to.
+    pub async fn printers(&self) -> Result<Vec<Printer>> {
+        match self {
+            #[cfg(feature = "ipp-client")]
+            Sink::Ipp(_) => Ok(Vec::new()),
+            Sink::Local { backend, .. } => {
+                let backend = backend.clone();
+                blocking(move || backend.printers()).await
+            }
+        }
+    }
+
     pub async fn print(&self, job: &Job<'_>) -> Result<()> {
         match self {
             #[cfg(feature = "ipp-client")]
@@ -199,20 +212,25 @@ impl Sink {
                 let backend = backend.clone();
                 let job = local::LocalJob::new(job, printer.as_deref(), *timeout);
 
-                // The local backends block on a child process, so they must
-                // not run on the async runtime's worker threads.
-                #[cfg(feature = "ipp-client")]
-                {
-                    tokio::task::spawn_blocking(move || backend.print_file(file.path(), &job))
-                        .await
-                        .map_err(|e| Error::Backend(format!("the print task failed: {e}")))?
-                }
-                #[cfg(not(feature = "ipp-client"))]
-                {
-                    backend.print_file(file.path(), &job)
-                }
+                blocking(move || backend.print_file(file.path(), &job)).await
             }
         }
+    }
+}
+
+/// Runs a local backend in a separate thread.
+async fn blocking<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    #[cfg(feature = "ipp-client")]
+    {
+        tokio::task::spawn_blocking(call)
+            .await
+            .map_err(|e| Error::Backend(format!("the print task failed: {e}")))?
+    }
+    #[cfg(not(feature = "ipp-client"))]
+    {
+        call()
     }
 }
 
@@ -235,19 +253,11 @@ fn helper(
 
 /// The Windows print spooler, if this platform and build have one.
 fn win_spooler() -> Result<Local> {
-    if !cfg!(windows) {
-        return Err(Error::Unsupported(
-            "the Windows print spooler is Windows-only; on Unix use lp or lpr".into(),
-        ));
+    if cfg!(all(windows, feature = "windows-spooler")) {
+        Ok(Local::WinSpooler)
+    } else {
+        Err(local::spooler_unavailable())
     }
-    if !cfg!(feature = "windows-spooler") {
-        return Err(Error::Unsupported(
-            "the Windows print spooler needs the windows-spooler feature, which this build \
-             turned off"
-                .into(),
-        ));
-    }
-    Ok(Local::WinSpooler)
 }
 
 #[cfg(feature = "ipp-client")]
@@ -469,6 +479,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("ipp-client"), "{error}");
+    }
+
+    #[cfg(feature = "ipp-client")]
+    #[tokio::test]
+    async fn an_ipp_sink_has_no_printers_to_offer() {
+        // The queue is in the URI, and IPP gives no way to browse for more.
+        let sink =
+            Sink::detect(Some("ipp://printer.lan/ipp/print"), None, DEFAULT_TIMEOUT).unwrap();
+        assert!(sink.printers().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_local_sink_lists_through_its_backend() {
+        let sink = Sink::Local {
+            backend: Local::DryRun,
+            printer: None,
+            timeout: DEFAULT_TIMEOUT,
+        };
+        assert!(sink.printers().await.unwrap().is_empty());
+
+        // A backend that cannot be asked reports that, rather than nothing.
+        let sink = Sink::detect(Some("command:mycmd {file}"), None, DEFAULT_TIMEOUT).unwrap();
+        assert!(sink.printers().await.is_err());
     }
 
     #[tokio::test]
