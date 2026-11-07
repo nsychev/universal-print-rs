@@ -17,8 +17,47 @@ use std::time::Duration;
 
 pub use local::{Local, LocalJob, Printer};
 
-/// How long a local print command may run before it is killed.
+/// Local backends are killed by timeout; IPP requests are limited on HTTP level.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Retry policy. Only for IPP backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retry {
+    pub attempts: u32,
+    pub initial_delay: Duration,
+    /// Delay doubles after each attempt, capped by `max_delay`.
+    pub max_delay: Duration,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Retry {
+            attempts: 4,
+            initial_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(30),
+        }
+    }
+}
+
+impl Retry {
+    pub const fn none() -> Self {
+        Retry {
+            attempts: 1,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        }
+    }
+
+    pub fn delay_before(&self, attempt: u32) -> Duration {
+        if attempt <= 1 {
+            return Duration::ZERO;
+        }
+        let doublings = attempt - 2;
+        self.initial_delay
+            .saturating_mul(2u32.saturating_pow(doublings.min(31)))
+            .min(self.max_delay)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -29,6 +68,10 @@ pub enum Error {
         status: ipp::model::StatusCode,
         detail: String,
     },
+    /// The printer took the request and never answered it.
+    #[cfg(feature = "ipp-client")]
+    #[error("{uri} did not answer within {timeout:?}")]
+    Timeout { uri: String, timeout: Duration },
     /// The job could not be sent at all.
     #[error("{0}")]
     Backend(String),
@@ -37,6 +80,22 @@ pub enum Error {
     Unsupported(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+}
+
+impl Error {
+    pub fn is_retryable(&self) -> bool {
+        #[cfg(feature = "ipp-client")]
+        if let Error::Rejected { status, .. } = self {
+            use ipp::model::StatusCode;
+            return matches!(
+                status,
+                StatusCode::ServerErrorBusy
+                    | StatusCode::ServerErrorTemporaryError
+                    | StatusCode::ServerErrorNotAcceptingJobs
+            );
+        }
+        false
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -109,7 +168,7 @@ impl Sink {
         // A URI is told apart by its scheme, which only `ipp://` and friends
         // can have: every other spec is a bare name or `name:value`.
         if value.is_some() && matches!(name.as_str(), "ipp" | "ipps" | "http" | "https") {
-            return ipp_sink(spec.unwrap_or_default(), printer);
+            return ipp_sink(spec.unwrap_or_default(), printer, timeout);
         }
 
         let backend = match name.as_str() {
@@ -144,6 +203,25 @@ impl Sink {
             printer: printer.map(str::to_string),
             timeout,
         })
+    }
+
+    /// Sets how often a busy printer is asked again.
+    ///
+    /// Only the IPP backend retries; for a local backend this does nothing.
+    pub fn with_retry(self, retry: Retry) -> Self {
+        #[cfg(feature = "ipp-client")]
+        {
+            let mut sink = self;
+            if let Sink::Ipp(ipp) = &mut sink {
+                ipp.set_retry(retry);
+            }
+            sink
+        }
+        #[cfg(not(feature = "ipp-client"))]
+        {
+            let _ = retry;
+            self
+        }
     }
 
     /// A description for a startup log line.
@@ -261,7 +339,7 @@ fn win_spooler() -> Result<Local> {
 }
 
 #[cfg(feature = "ipp-client")]
-fn ipp_sink(uri: &str, printer: Option<&str>) -> Result<Sink> {
+fn ipp_sink(uri: &str, printer: Option<&str>, timeout: Duration) -> Result<Sink> {
     if let Some(printer) = printer {
         return Err(Error::Unsupported(format!(
             "an IPP URI already names its queue, so it cannot also be pointed at {printer:?}"
@@ -270,11 +348,11 @@ fn ipp_sink(uri: &str, printer: Option<&str>) -> Result<Sink> {
     let parsed = uri
         .parse::<ipp::prelude::Uri>()
         .map_err(|e| Error::Unsupported(format!("{uri:?} is not a usable IPP URI: {e}")))?;
-    Ok(Sink::Ipp(ipp_client::IppSink::new(parsed)))
+    Ok(Sink::Ipp(ipp_client::IppSink::new(parsed, timeout)))
 }
 
 #[cfg(not(feature = "ipp-client"))]
-fn ipp_sink(uri: &str, _printer: Option<&str>) -> Result<Sink> {
+fn ipp_sink(uri: &str, _printer: Option<&str>, _timeout: Duration) -> Result<Sink> {
     Err(Error::Unsupported(format!(
         "cannot print to {uri:?}: the ipp-client feature is off in this build"
     )))
@@ -479,6 +557,87 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("ipp-client"), "{error}");
+    }
+
+    #[test]
+    fn the_wait_between_attempts_doubles_up_to_the_ceiling() {
+        let retry = Retry {
+            attempts: 6,
+            initial_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(10),
+        };
+        // The first attempt is immediate; the rest back off.
+        assert_eq!(retry.delay_before(1), Duration::ZERO);
+        assert_eq!(retry.delay_before(2), Duration::from_secs(2));
+        assert_eq!(retry.delay_before(3), Duration::from_secs(4));
+        assert_eq!(retry.delay_before(4), Duration::from_secs(8));
+        // Capped, not doubled for ever.
+        assert_eq!(retry.delay_before(5), Duration::from_secs(10));
+        assert_eq!(retry.delay_before(99), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_default_schedule_is_over_in_well_under_a_minute() {
+        // A job held too long stops being worth printing, and the queue
+        // behind it is waiting.
+        let retry = Retry::default();
+        let total: Duration = (1..=retry.attempts).map(|n| retry.delay_before(n)).sum();
+        assert!(total <= Duration::from_secs(20), "{total:?}");
+        assert_eq!(Retry::none().attempts, 1);
+    }
+
+    #[cfg(feature = "ipp-client")]
+    #[test]
+    fn only_the_printers_ask_me_later_statuses_are_worth_another_go() {
+        use ipp::model::StatusCode;
+
+        let rejected = |status| Error::Rejected {
+            status,
+            detail: String::new(),
+        };
+        assert!(rejected(StatusCode::ServerErrorBusy).is_retryable());
+        assert!(rejected(StatusCode::ServerErrorTemporaryError).is_retryable());
+        assert!(rejected(StatusCode::ServerErrorNotAcceptingJobs).is_retryable());
+
+        // The document will be just as unsupported in two seconds.
+        assert!(!rejected(StatusCode::ClientErrorDocumentFormatNotSupported).is_retryable());
+        assert!(!rejected(StatusCode::ServerErrorInternalError).is_retryable());
+        assert!(!Error::Backend("no route to host".into()).is_retryable());
+    }
+
+    #[cfg(feature = "ipp-client")]
+    #[test]
+    fn an_ipp_sink_keeps_the_timeout_it_was_given() {
+        // Without this the IPP backend waits for ever on a printer that
+        // accepts the connection and then says nothing.
+        let sink = Sink::detect(
+            Some("ipp://printer.lan/ipp/print"),
+            None,
+            Duration::from_secs(7),
+        )
+        .unwrap();
+        match sink {
+            Sink::Ipp(sink) => assert_eq!(sink.timeout(), Duration::from_secs(7)),
+            other => panic!("expected an IPP sink, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "ipp-client")]
+    #[test]
+    fn the_retry_schedule_can_be_set_on_a_built_sink() {
+        let sink = Sink::detect(Some("ipp://printer.lan/ipp/print"), None, DEFAULT_TIMEOUT)
+            .unwrap()
+            .with_retry(Retry::none());
+        match sink {
+            Sink::Ipp(sink) => assert_eq!(sink.retry(), Retry::none()),
+            other => panic!("expected an IPP sink, got {other:?}"),
+        }
+
+        // A local backend has no use for it, and must not choke on it.
+        let local = Sink::detect(Some("dry-run"), None, DEFAULT_TIMEOUT)
+            .unwrap()
+            .with_retry(Retry::none());
+        assert!(matches!(local, Sink::Local { .. }));
     }
 
     #[cfg(feature = "ipp-client")]

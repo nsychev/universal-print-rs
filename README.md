@@ -42,6 +42,7 @@ sink.print(&Job::new(b"%PDF-1.7 ...", "application/pdf", "my job")).await?;
 ## Build from spec and auto-detect
 
 `Sink::detect(spec, printer, timeout)` builds a sink from a spec.
+`timeout` caps a single print attempt, 120 seconds by default.
 
 If `None` or `"auto"` is passed as `spec`, the backend is auto-detected:
 
